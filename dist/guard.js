@@ -1,0 +1,118 @@
+// Payment guard: every check here runs BEFORE anything is signed.
+export const NANO_MAINNET = "nano:mainnet";
+const RAW_PER_XNO = 10n ** 30n;
+const MAX_NANO_RAW = 2n ** 128n - 1n;
+/** Convert a decimal XNO string ("0.001") to raw (bigint). */
+export function xnoToRaw(xno) {
+    if (!/^\d+(\.\d{1,30})?$/.test(xno))
+        throw new Error(`bad XNO amount ${JSON.stringify(xno)}`);
+    const [i, f = ""] = xno.split(".");
+    return BigInt(i) * RAW_PER_XNO + BigInt((f + "0".repeat(30)).slice(0, 30));
+}
+export class GuardRefusal extends Error {
+    code;
+    constructor(code, message) {
+        super(`payment refused (${code}): ${message}`);
+        this.code = code;
+        this.name = "GuardRefusal";
+    }
+}
+const ADDR = /^(nano|xrb)_[13][13456789abcdefghijkmnopqrstuwxyz]{59}$/;
+const norm = (a) => a.replace(/^xrb_/, "nano_");
+export class PaymentGuard {
+    cfg;
+    network;
+    allow;
+    spentRaw = 0n;
+    paidKeys = new Set();
+    inFlight = new Set();
+    now;
+    constructor(cfg) {
+        this.cfg = cfg;
+        if (!cfg.payToAllowlist?.length)
+            throw new Error("payToAllowlist must name at least one Nano account");
+        if (cfg.maxPerCallRaw <= 0n || cfg.maxTotalRaw <= 0n)
+            throw new Error("caps must be positive");
+        this.network = cfg.network ?? NANO_MAINNET;
+        this.allow = new Set(cfg.payToAllowlist.map(norm));
+        this.now = cfg.now ?? Date.now;
+    }
+    get spent() { return this.spentRaw; }
+    /** Pick the nano exact entry from a decoded PAYMENT-REQUIRED body, refusing anything malformed. */
+    pick(required) {
+        const r = required;
+        if (!r || typeof r !== "object" || r.x402Version !== 2)
+            throw new GuardRefusal("malformed", "PAYMENT-REQUIRED is not an x402 v2 body");
+        if (!r.resource || typeof r.resource.url !== "string" || !r.resource.url)
+            throw new GuardRefusal("malformed", "resource.url missing");
+        if (!Array.isArray(r.accepts) || !r.accepts.length)
+            throw new GuardRefusal("malformed", "accepts is empty");
+        const exact = r.accepts.filter((a) => a && a.scheme === "exact");
+        if (!exact.length)
+            throw new GuardRefusal("malformed", "no exact scheme offered");
+        const onNet = exact.find((a) => a.network === this.network);
+        if (!onNet)
+            throw new GuardRefusal("wrong_network", `no exact entry on ${this.network} (offered: ${exact.map((a) => a.network).join(", ")})`);
+        return onNet;
+    }
+    /**
+     * Check a quote and reserve its amount against the caps. Returns a release() to call if
+     * nothing was sent (so the reservation is undone). Throws GuardRefusal otherwise.
+     * `key` identifies the logical request (method + url + body); a key that has already paid,
+     * or is paying right now, is refused so a second invocation never signs a second block.
+     */
+    authorize(q, requestUrl, key) {
+        const a = q.accepted;
+        if (a.network !== this.network)
+            throw new GuardRefusal("wrong_network", `quote is on ${a.network}, operator allows ${this.network}`);
+        if (a.scheme !== "exact")
+            throw new GuardRefusal("malformed", `scheme ${a.scheme}`);
+        if (String(a.asset).toUpperCase() !== "XNO")
+            throw new GuardRefusal("malformed", `asset ${JSON.stringify(a.asset)}`);
+        if (typeof a.payTo !== "string" || !ADDR.test(a.payTo))
+            throw new GuardRefusal("malformed", `payTo ${JSON.stringify(a.payTo)} is not a Nano address`);
+        if (typeof a.amount !== "string" || !/^[1-9]\d*$/.test(a.amount))
+            throw new GuardRefusal("malformed", `amount ${JSON.stringify(a.amount)}`);
+        const amount = BigInt(a.amount);
+        if (amount > MAX_NANO_RAW)
+            throw new GuardRefusal("malformed", "amount above Nano supply");
+        if (a.maxTimeoutSeconds !== undefined && (typeof a.maxTimeoutSeconds !== "number" || !(a.maxTimeoutSeconds > 0)))
+            throw new GuardRefusal("malformed", "maxTimeoutSeconds invalid");
+        const reqOrigin = new URL(requestUrl).origin;
+        if (q.origin !== reqOrigin)
+            throw new GuardRefusal("cross_origin", `quote came from ${q.origin}, request was to ${reqOrigin}`);
+        let resOrigin;
+        try {
+            resOrigin = new URL(q.required.resource.url).origin;
+        }
+        catch {
+            throw new GuardRefusal("malformed", "resource.url is not a URL");
+        }
+        if (resOrigin !== reqOrigin)
+            throw new GuardRefusal("cross_origin", `resource.url points at ${resOrigin}`);
+        if (!this.allow.has(norm(a.payTo)))
+            throw new GuardRefusal("payto_not_allowed", `${a.payTo} is not in the operator allowlist`);
+        if (amount > this.cfg.maxPerCallRaw)
+            throw new GuardRefusal("over_call_cap", `${amount} raw > per-call cap ${this.cfg.maxPerCallRaw}`);
+        if (this.spentRaw + amount > this.cfg.maxTotalRaw)
+            throw new GuardRefusal("over_total_cap", `${this.spentRaw} + ${amount} raw > cumulative cap ${this.cfg.maxTotalRaw}`);
+        if (this.isStale(q))
+            throw new GuardRefusal("stale_quote", "quote older than maxTimeoutSeconds; re-fetch it");
+        if (this.paidKeys.has(key) || this.inFlight.has(key))
+            throw new GuardRefusal("duplicate", "this request was already paid (or is being paid)");
+        this.spentRaw += amount;
+        this.inFlight.add(key);
+        let done = false;
+        return {
+            amount,
+            commit: () => { if (done)
+                return; done = true; this.inFlight.delete(key); this.paidKeys.add(key); },
+            release: () => { if (done)
+                return; done = true; this.inFlight.delete(key); this.spentRaw -= amount; },
+        };
+    }
+    isStale(q) {
+        const ttl = (q.accepted.maxTimeoutSeconds ?? 60) * 1000;
+        return this.now() - q.receivedAt >= ttl;
+    }
+}

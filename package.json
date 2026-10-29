@@ -1,0 +1,16 @@
+{
+  "name": "eliza-plugin-nano-x402",
+  "version": "0.1.0",
+  "description": "ElizaOS plugin: pay Nano (XNO) x402 'exact' quotes from your agent, behind an offline-tested guard (payTo allowlist, per-call and cumulative caps, no double-sign, no cross-origin pay, no stale quotes).",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": { "build": "tsc -p .", "test": "vitest run", "prepublishOnly": "npm run build && npm test" },
+  "keywords": ["elizaos", "eliza", "plugin", "x402", "nano", "xno", "payments"],
+  "license": "MIT",
+  "dependencies": { "nanocurrency": "2.5.0" },
+  "peerDependencies": { "@elizaos/core": "1.7.2" },
+  "devDependencies": { "@elizaos/core": "1.7.2", "@types/node": "22.19.1", "typescript": "5.9.3", "vitest": "4.1.12" }
+}
